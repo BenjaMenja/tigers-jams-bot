@@ -1,9 +1,11 @@
 import logging
+import aiohttp
 from pathlib import Path
 
 import discord
 from discord import app_commands
 from discord.ext import commands
+from requests import get
 
 import config
 from player import GuildPlayer
@@ -19,6 +21,9 @@ def get_humans(channel: discord.VoiceChannel | discord.StageChannel) -> list[dis
 def shorten_path(path: Path) -> str:
     return path.stem if len(path.stem) <= 80 else path.stem[:77] + "..."
 
+def trim_text(text: str, limit: int = 100) -> str:
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
 def format_queue(current: Path | None, upcoming: list[Path]) -> str:
     if current is None:
         return "Nothing is playing."
@@ -28,6 +33,40 @@ def format_queue(current: Path | None, upcoming: list[Path]) -> str:
         lines += [f"{i}. {shorten_path(p)}" for i, p in enumerate(upcoming, start=1)]
     return "\n".join(lines)
 
+def resolve_song(file_path: str) -> Path | None:
+    root = config.MUSIC_DIR.resolve()
+    try:
+        audio_file = (root / file_path).resolve()
+    except (OSError, ValueError):
+        return None
+    if audio_file.is_relative_to(root) and audio_file.is_file():
+        return audio_file
+    return None
+
+class SongChoiceView(discord.ui.View):
+    def __init__(self, cog: "Music", owner_id: int, songs: list[tuple[str, Path]]):
+        super().__init__(timeout=60)
+        self.cog = cog
+        self.owner_id = owner_id
+        self.songs = songs
+        self.picker.options = [
+            discord.SelectOption(label=trim_text(label), value=str(i))
+            for i, (label, _) in enumerate(songs)
+        ]
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Only the person who ran /search can choose.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.select(placeholder="Choose a song...")
+    async def picker(self, interaction: discord.Interaction, select: discord.ui.Select) -> None:
+        label, path = self.songs[int(select.values[0])]
+        self.stop()
+        await interaction.response.edit_message(content=f"Selected {label}.", view=None)
+        await self.cog.request_song(interaction, label, path)
 
 class Music(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -51,6 +90,19 @@ class Music(commands.Cog):
         if player is None:
             await interaction.response.send_message("Use /join first.", ephemeral=True)
         return player
+
+    async def request_song(self, interaction: discord.Interaction, label: str, path: Path) -> None:
+        guild = interaction.guild
+        player = self.players.get(guild.id) if guild is not None else None
+        if player is None:
+            await interaction.followup.send("Use /join first.", ephemeral=True)
+            return
+
+        await player.add_request(path)
+        requesting_user = interaction.user.display_name
+
+        message = f"{requesting_user} requested: {label}"
+        await interaction.followup.send(message, ephemeral=False)
 
     @app_commands.command(name="join", description="Join your voice channel")
     @app_commands.guild_only()
@@ -173,6 +225,42 @@ class Music(commands.Cog):
             message = f"**Now playing:** {shorten_path(player.current)}"
         await interaction.response.send_message(message)
 
+    @app_commands.command(name="search", description="Search for a song by its title, artist, and source media.")
+    @app_commands.guild_only()
+    async def search_for_song(self, interaction: discord.Interaction, *, title: str | None, artist: str | None, source: str | None):
+        player = await self.require_player(interaction)
+        if player is None:
+            return
+
+        params = {
+            key: value
+            for key, value in (("title", title), ("artist", artist), ("source", source))
+            if value is not None
+        }
+
+        await interaction.response.defer(ephemeral=True)
+        async with aiohttp.ClientSession() as session:
+            async with session.get(config.DB_PATH, params=params) as response:
+                data = await response.json()
+
+        songs: list[tuple[str, Path]] = []
+        for entry in data[:10]:
+            path = resolve_song(entry["file_path"])
+            if path is None:
+                continue
+            name = entry.get("search_title") or entry.get("title") or path.stem
+            artist_name = entry.get("artist")
+            songs.append((f"{artist_name} – {name}" if artist_name else name, path))
+
+        if not songs:
+            await interaction.edit_original_response(content="No matching songs found.")
+        elif len(songs) == 1:
+            label, path = songs[0]
+            await interaction.edit_original_response(content=f"Selected {label}.")
+            await self.request_song(interaction, label, path)
+        else:
+            await interaction.edit_original_response(content="Pick a song:", view=SongChoiceView(self, interaction.user.id, songs))
+                
     @commands.Cog.listener()
     async def on_voice_state_update(
         self,

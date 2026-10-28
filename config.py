@@ -14,3 +14,4 @@ MUSIC_DIR = Path(os.getenv("MUSIC_DIR", r"./audio"))
 AUDIO_EXTENSIONS = {".mp3", ".flac", ".wav", ".ogg", ".m4a", ".opus"}
 IDLE_TIMEOUT_SECONDS = 5 * 60
 PLAYLIST_NAME = os.getenv("PLAYLIST_NAME") or "Audio Playlist"
+DB_PATH = os.getenv("DB_URL") or "localhost:8000/"

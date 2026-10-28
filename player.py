@@ -3,6 +3,7 @@ import logging
 import random
 from pathlib import Path
 from typing import Callable
+from collections import deque
 
 import discord
 
@@ -33,8 +34,10 @@ class GuildPlayer:
         self.voice_client = voice_client
         self.shuffle = shuffle
         self.queue: list[Path] = []
+        self.requests: deque[Path] = deque()
         self.index = 0
         self.current: Path | None = None
+        self.playlist_active = False
 
         self.scanner = scanner
         self.timeout_duration = timeout_duration
@@ -70,10 +73,12 @@ class GuildPlayer:
         self.queue[self.index:] = remaining
 
     def get_upcoming(self, count: int = 10) -> list[Path]:
-        return self.queue[self.index:self.index + count]
+        upcoming = list(self.requests) + self.queue[self.index:]
+        return upcoming[:count]
 
     async def start(self) -> None:
         self.counter += 1
+        self.playlist_active = True
         self.stop_voice_client()
         self.current = None
         self.error_streak = 0
@@ -92,6 +97,7 @@ class GuildPlayer:
 
     def stop(self) -> None:
         self.counter += 1
+        self.playlist_active = False
         self.stop_voice_client()
         self.current = None
         self.queue = []
@@ -107,15 +113,19 @@ class GuildPlayer:
             self.current = None
             return
 
-        if self.index >= len(self.queue):
-            self.rebuild_queue(last_played=self.current)
-            if not self.queue:
-                log.warning("No audio files found.")
-                self.current = None
-                return
-
-        audio = self.queue[self.index]
-        self.index += 1
+        if self.requests:
+            audio = self.requests.popleft()
+        elif not self.playlist_active:
+            self.current = None
+            return
+        else:
+            if self.index >= len(self.queue):
+                self.rebuild_queue(last_played=self.current)
+                if not self.queue:
+                    self.current = None
+                    return
+            audio = self.queue[self.index]
+            self.index += 1
         self.current = audio
         self.counter += 1
         counter = self.counter
@@ -146,6 +156,7 @@ class GuildPlayer:
             log.warning(f"Track failed or ended instantly. Error number {self.error_streak} is: {error}")
             if self.error_streak >= MAX_CONSECUTIVE_ERRORS:
                 log.error("Too many consecutive errors. Stopping...")
+                self.playlist_active = False
                 self.current = None
                 return
         else:
@@ -173,6 +184,13 @@ class GuildPlayer:
             self.timeout.cancel()
         self.timeout = None
 
+    async def add_request(self, path: Path) -> bool:
+        self.requests.append(path)
+        if self.current is None:
+            await self.play_next()
+            return True
+        return False
+
     async def create_timeout(self) -> None:
         try:
             await asyncio.sleep(self.timeout_duration)
@@ -186,6 +204,7 @@ class GuildPlayer:
     async def close(self, *, disconnect: bool = True) -> None:
         self.closed = True
         self.counter += 1
+        self.requests.clear()
         self.current = None
         self.cancel_timeout()
         self.stop_voice_client()
